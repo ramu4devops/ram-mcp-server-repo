@@ -1,0 +1,162 @@
+# MCP Security Review — pull-request gate (all modules)
+# Add this file to your MCP-server repository at:
+#   .github/workflows/mcp-security-review.yml
+#
+# It reviews every PR into `main` with all 10 MCP security modules, blocks the
+# merge on a blocking finding, uploads SARIF, comments on the PR, and emails the
+# requestor + security team. Tuned for a PUBLIC repo on GitHub Free.
+#
+# Repo settings it needs (all set in the GitHub website — see the setup guide):
+#   Variables : MCP_TOOLKIT_REPO   e.g. your-name/mcp-security-toolkit  (public)
+#               MCP_TOOLKIT_REF     optional, default "main"
+#               MCP_FAIL_ON         optional, "block" (default) or "review"
+#   Secrets   : MAIL_USERNAME       the Gmail address that sends the mail
+#               MAIL_PASSWORD       a Gmail App Password (not your login password)
+#               SECURITY_TEAM_EMAILS comma-separated list, e.g. secteam@acme.com
+name: MCP Security Review
+
+on:
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  security-events: write   # publish SARIF to the Security tab (free on public repos)
+  pull-requests: write     # post the sticky PR comment
+
+concurrency:
+  group: mcp-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # This job's name is the required status-check name you pick in branch
+    # protection. Do not rename it without updating the rule.
+    name: MCP Security Review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repo (the MCP server) into server/
+        uses: actions/checkout@v4
+        with:
+          path: server
+          fetch-depth: 0
+
+      - name: Check out the scanner toolkit into toolkit/
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.MCP_TOOLKIT_REPO }}
+          ref: ${{ vars.MCP_TOOLKIT_REF || 'main' }}
+          path: toolkit
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache the sandbox image
+        uses: actions/cache@v4
+        with:
+          path: /tmp/mcp-img
+          key: mcp-sec-scanner-${{ hashFiles('toolkit/sandbox/**') }}
+
+      - name: Load or build the scanner image
+        run: |
+          if [ -f /tmp/mcp-img/image.tar ]; then
+            echo "Restoring cached image…"; docker load -i /tmp/mcp-img/image.tar
+          else
+            echo "Building scanner image…"
+            docker build -t mcp-sec-scanner:latest toolkit/sandbox
+            mkdir -p /tmp/mcp-img
+            docker save mcp-sec-scanner:latest -o /tmp/mcp-img/image.tar
+          fi
+
+      - name: Run the MCP security review (all 10 modules)
+        id: review
+        env:
+          NO_COLOR: "1"
+        run: |
+          set +e
+          python3 toolkit/cli/mcp_review.py "$GITHUB_WORKSPACE/server" \
+            --name "${{ github.event.repository.name }}" \
+            --all --rug-pull-mode pin \
+            --out "$GITHUB_WORKSPACE/mcp-report" \
+            --fail-on "${{ vars.MCP_FAIL_ON || 'block' }}"
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: Resolve the requestor's email (best effort)
+        id: requestor
+        if: always()
+        run: |
+          email="$(git -C server log -1 --format='%ae' '${{ github.event.pull_request.head.sha }}' 2>/dev/null || true)"
+          case "$email" in
+            *@users.noreply.github.com|"") email="" ;;
+          esac
+          echo "email=$email" >> "$GITHUB_OUTPUT"
+
+      - name: Build notification bodies (email + PR comment)
+        id: notify
+        if: always()
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 toolkit/notify/build_email.py mcp-report
+          {
+            echo 'subject<<__EOF__'; cat mcp-report/email-subject.txt; echo '__EOF__'
+            echo 'html<<__EOF__';    cat mcp-report/email-body.html;   echo '__EOF__'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: mcp-report
+          category: mcp-security-review
+
+      - name: Attach the HTML + JSON report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-security-report
+          path: |
+            mcp-report/*.report.html
+            mcp-report/*.report.json
+            mcp-report/*.sarif
+          if-no-files-found: warn
+
+      - name: Post / update the PR comment
+        if: always()
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: mcp-security-review
+          path: mcp-report/pr-comment.md
+
+      - name: Email the requestor + security team
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: ${{ steps.notify.outputs.subject }}
+          to: ${{ secrets.SECURITY_TEAM_EMAILS }}
+          cc: ${{ steps.requestor.outputs.email }}
+          from: MCP Security Gate <${{ secrets.MAIL_USERNAME }}>
+          html_body: ${{ steps.notify.outputs.html }}
+          attachments: mcp-report/${{ github.event.repository.name }}.report.html
+
+      - name: Enforce the gate
+        if: always()
+        run: |
+          code="${{ steps.review.outputs.exit_code }}"
+          if [ "$code" = "2" ] || [ "$code" = "3" ]; then
+            echo "::error::MCP Security Review returned a BLOCKING verdict — merge is gated."
+            exit 1
+          fi
+          echo "No blocking verdict — gate passes."

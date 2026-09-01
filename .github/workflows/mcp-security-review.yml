@@ -105,16 +105,26 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python3 toolkit/notify/build_email.py mcp-report
+          # A blank `echo` before each closing delimiter guarantees it starts on its
+          # own line even if the source file had no trailing newline -- otherwise
+          # GitHub's multiline-output parser can't find the delimiter and this step
+          # fails with "Matching delimiter not found".
           {
-            echo 'subject<<__EOF__'; cat mcp-report/email-subject.txt; echo '__EOF__'
-            echo 'html<<__EOF__';    cat mcp-report/email-body.html;   echo '__EOF__'
+            echo 'subject<<__EOF__'; cat mcp-report/email-subject.txt; echo; echo '__EOF__'
+            echo 'html<<__EOF__';    cat mcp-report/email-body.html;   echo; echo '__EOF__'
           } >> "$GITHUB_OUTPUT"
 
       - name: Upload SARIF to code scanning
         if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: mcp-report
+          # Upload only the single combined report -- it already merges all 10
+          # modules' findings into one SARIF run. Pointing this at the mcp-report/
+          # *directory* instead uploads the combined file AND the 9 per-module
+          # SARIF files as separate runs under the same category, which GitHub
+          # Actions now rejects ("does not support uploading multiple SARIF runs
+          # with the same category").
+          sarif_file: mcp-report/${{ github.event.repository.name }}.report.sarif
           category: mcp-security-review
 
       - name: Attach the HTML + JSON report

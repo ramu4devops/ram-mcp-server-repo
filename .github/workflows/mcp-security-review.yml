@@ -127,16 +127,27 @@ jobs:
           sarif_file: mcp-report/${{ github.event.repository.name }}.report.sarif
           category: mcp-security-review
 
-      - name: Attach the HTML + JSON report
+      - name: Attach the HTML + Markdown + JSON report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mcp-security-report
           path: |
             mcp-report/*.report.html
+            mcp-report/*.report.md
             mcp-report/*.report.json
             mcp-report/*.sarif
           if-no-files-found: warn
+
+      - name: Publish the full findings to the Job Summary
+        if: always()
+        run: |
+          # Renders on this run's Summary tab -- readable immediately, no
+          # artifact download needed. Falls back quietly if the file is missing
+          # (e.g. the review step errored before writing any report).
+          if [ -f "mcp-report/${{ github.event.repository.name }}.report.md" ]; then
+            cat "mcp-report/${{ github.event.repository.name }}.report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Post / update the PR comment
         if: always()
